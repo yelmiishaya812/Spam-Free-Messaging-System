@@ -321,6 +321,16 @@
 (define-constant category-announcement u4)
 (define-constant category-other u5)
 
+(define-constant priority-low u1)
+(define-constant priority-normal u2)
+(define-constant priority-high u3)
+(define-constant priority-urgent u4)
+
+(define-constant priority-multiplier-low u1)
+(define-constant priority-multiplier-normal u2)
+(define-constant priority-multiplier-high u5)
+(define-constant priority-multiplier-urgent u10)
+
 (define-map user-category-preferences
     { user: principal }
     {
@@ -335,6 +345,25 @@
 (define-map message-categories
     { message-id: uint }
     { category: uint }
+)
+
+(define-map message-priorities
+    { message-id: uint }
+    {
+        priority: uint,
+        stake-amount: uint,
+    }
+)
+
+(define-map user-priority-filters
+    { user: principal }
+    {
+        min-priority: uint,
+        allow-low: bool,
+        allow-normal: bool,
+        allow-high: bool,
+        allow-urgent: bool,
+    }
 )
 
 (define-public (send-categorized-message
@@ -675,5 +704,144 @@
     (match (map-get? message-threads { message-id: message-id })
         thread-info (some (get thread-root thread-info))
         none
+    )
+)
+
+(define-public (send-priority-message
+        (recipient principal)
+        (content (string-utf8 280))
+        (priority uint)
+    )
+    (let (
+            (message-id (var-get total-messages))
+            (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+            (stake-multiplier (get-priority-multiplier priority))
+            (required-stake (* message-stake stake-multiplier))
+        )
+        (asserts! (not (is-eq tx-sender recipient)) (err u301))
+        (asserts! (> (len content) u0) (err u302))
+        (asserts! (<= (len content) max-content-length) (err u303))
+        (asserts! (and (>= priority u1) (<= priority u4)) (err u304))
+        (asserts! (is-priority-allowed recipient priority) (err u305))
+        (asserts!
+            (not (default-to false
+                (get is-blocked
+                    (map-get? blocked-users {
+                        blocker: recipient,
+                        blocked: tx-sender,
+                    })
+                )))
+            (err u306)
+        )
+        (try! (stx-transfer? required-stake tx-sender (as-contract tx-sender)))
+        (map-set messages { message-id: message-id } {
+            sender: tx-sender,
+            recipient: recipient,
+            content: content,
+            stake: required-stake,
+            timestamp: current-time,
+            reports: u0,
+            refunded: false,
+            is-spam: false,
+        })
+        (map-set message-priorities { message-id: message-id } {
+            priority: priority,
+            stake-amount: required-stake,
+        })
+        (update-user-stats tx-sender true)
+        (update-user-stats recipient false)
+        (var-set total-messages (+ message-id u1))
+        (var-set total-stakes (+ (var-get total-stakes) required-stake))
+        (var-set contract-balance (+ (var-get contract-balance) required-stake))
+        (ok message-id)
+    )
+)
+
+(define-public (set-priority-filters
+        (min-priority uint)
+        (allow-low bool)
+        (allow-normal bool)
+        (allow-high bool)
+        (allow-urgent bool)
+    )
+    (begin
+        (asserts! (and (>= min-priority u1) (<= min-priority u4)) (err u307))
+        (map-set user-priority-filters { user: tx-sender } {
+            min-priority: min-priority,
+            allow-low: allow-low,
+            allow-normal: allow-normal,
+            allow-high: allow-high,
+            allow-urgent: allow-urgent,
+        })
+        (ok true)
+    )
+)
+
+(define-private (get-priority-multiplier (priority uint))
+    (if (is-eq priority priority-low)
+        priority-multiplier-low
+        (if (is-eq priority priority-normal)
+            priority-multiplier-normal
+            (if (is-eq priority priority-high)
+                priority-multiplier-high
+                priority-multiplier-urgent
+            )
+        )
+    )
+)
+
+(define-private (is-priority-allowed
+        (user principal)
+        (priority uint)
+    )
+    (let ((filters (get-user-priority-filters user)))
+        (and
+            (>= priority (get min-priority filters))
+            (if (is-eq priority priority-low)
+                (get allow-low filters)
+                (if (is-eq priority priority-normal)
+                    (get allow-normal filters)
+                    (if (is-eq priority priority-high)
+                        (get allow-high filters)
+                        (get allow-urgent filters)
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-private (get-user-priority-filters (user principal))
+    (default-to {
+        min-priority: u1,
+        allow-low: true,
+        allow-normal: true,
+        allow-high: true,
+        allow-urgent: true,
+    }
+        (map-get? user-priority-filters { user: user })
+    )
+)
+
+(define-read-only (get-message-priority (message-id uint))
+    (map-get? message-priorities { message-id: message-id })
+)
+
+(define-read-only (get-user-priority-settings (user principal))
+    (map-get? user-priority-filters { user: user })
+)
+
+(define-read-only (calculate-priority-stake (priority uint))
+    (* message-stake (get-priority-multiplier priority))
+)
+
+(define-read-only (can-send-priority
+        (sender principal)
+        (recipient principal)
+        (priority uint)
+    )
+    (and
+        (not (is-user-blocked recipient sender))
+        (is-priority-allowed recipient priority)
     )
 )
