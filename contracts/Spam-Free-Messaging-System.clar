@@ -845,3 +845,281 @@
         (is-priority-allowed recipient priority)
     )
 )
+
+(define-constant subscription-base-fee u500000)
+(define-constant broadcast-multiplier u3)
+
+(define-data-var total-subscriptions uint u0)
+
+(define-map subscription-channels
+    { channel-id: uint }
+    {
+        creator: principal,
+        title: (string-utf8 100),
+        description: (string-utf8 200),
+        subscription-fee: uint,
+        subscriber-count: uint,
+        total-earnings: uint,
+        is-active: bool,
+        created-time: uint,
+    }
+)
+
+(define-map channel-subscribers
+    {
+        channel-id: uint,
+        subscriber: principal,
+    }
+    {
+        subscribed-time: uint,
+        is-active: bool,
+    }
+)
+
+(define-map user-subscription-stats
+    { user: principal }
+    {
+        channels-created: uint,
+        channels-subscribed: uint,
+        total-subscription-fees-paid: uint,
+        total-earnings-from-channels: uint,
+    }
+)
+
+(define-map broadcast-messages
+    { message-id: uint }
+    {
+        channel-id: uint,
+        subscriber-count-at-time: uint,
+        total-broadcast-fee: uint,
+    }
+)
+
+(define-public (create-subscription-channel
+        (title (string-utf8 100))
+        (description (string-utf8 200))
+        (subscription-fee uint)
+    )
+    (let (
+            (channel-id (var-get total-subscriptions))
+            (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        )
+        (asserts! (> (len title) u0) (err u401))
+        (asserts! (<= (len title) u100) (err u402))
+        (asserts! (<= (len description) u200) (err u403))
+        (asserts! (>= subscription-fee subscription-base-fee) (err u404))
+        (map-set subscription-channels { channel-id: channel-id } {
+            creator: tx-sender,
+            title: title,
+            description: description,
+            subscription-fee: subscription-fee,
+            subscriber-count: u0,
+            total-earnings: u0,
+            is-active: true,
+            created-time: current-time,
+        })
+        (update-user-subscription-stats tx-sender true false u0 u0)
+        (var-set total-subscriptions (+ channel-id u1))
+        (ok channel-id)
+    )
+)
+
+(define-public (subscribe-to-channel (channel-id uint))
+    (let (
+            (channel (unwrap! (map-get? subscription-channels { channel-id: channel-id })
+                (err u405)
+            ))
+            (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+            (subscription-fee (get subscription-fee channel))
+        )
+        (asserts! (get is-active channel) (err u406))
+        (asserts! (not (is-eq tx-sender (get creator channel))) (err u407))
+        (asserts!
+            (not (default-to false
+                (get is-active
+                    (map-get? channel-subscribers {
+                        channel-id: channel-id,
+                        subscriber: tx-sender,
+                    })
+                )))
+            (err u408)
+        )
+        (try! (stx-transfer? subscription-fee tx-sender (get creator channel)))
+        (map-set channel-subscribers {
+            channel-id: channel-id,
+            subscriber: tx-sender,
+        } {
+            subscribed-time: current-time,
+            is-active: true,
+        })
+        (map-set subscription-channels { channel-id: channel-id }
+            (merge channel {
+                subscriber-count: (+ (get subscriber-count channel) u1),
+                total-earnings: (+ (get total-earnings channel) subscription-fee),
+            })
+        )
+        (update-user-subscription-stats tx-sender false true subscription-fee u0)
+        (update-user-subscription-stats (get creator channel) false false u0
+            subscription-fee
+        )
+        (ok true)
+    )
+)
+
+(define-public (broadcast-to-channel
+        (channel-id uint)
+        (content (string-utf8 280))
+    )
+    (let (
+            (channel (unwrap! (map-get? subscription-channels { channel-id: channel-id })
+                (err u409)
+            ))
+            (message-id (var-get total-messages))
+            (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+            (subscriber-count (get subscriber-count channel))
+            (broadcast-fee (* message-stake broadcast-multiplier subscriber-count))
+        )
+        (asserts! (is-eq tx-sender (get creator channel)) (err u410))
+        (asserts! (get is-active channel) (err u411))
+        (asserts! (> (len content) u0) (err u412))
+        (asserts! (<= (len content) max-content-length) (err u413))
+        (asserts! (> subscriber-count u0) (err u414))
+        (try! (stx-transfer? broadcast-fee tx-sender (as-contract tx-sender)))
+        (map-set messages { message-id: message-id } {
+            sender: tx-sender,
+            recipient: tx-sender,
+            content: content,
+            stake: broadcast-fee,
+            timestamp: current-time,
+            reports: u0,
+            refunded: false,
+            is-spam: false,
+        })
+        (map-set broadcast-messages { message-id: message-id } {
+            channel-id: channel-id,
+            subscriber-count-at-time: subscriber-count,
+            total-broadcast-fee: broadcast-fee,
+        })
+        (update-user-stats tx-sender true)
+        (var-set total-messages (+ message-id u1))
+        (var-set total-stakes (+ (var-get total-stakes) broadcast-fee))
+        (var-set contract-balance (+ (var-get contract-balance) broadcast-fee))
+        (ok message-id)
+    )
+)
+
+(define-public (unsubscribe-from-channel (channel-id uint))
+    (let (
+            (channel (unwrap! (map-get? subscription-channels { channel-id: channel-id })
+                (err u415)
+            ))
+            (subscription-info (unwrap!
+                (map-get? channel-subscribers {
+                    channel-id: channel-id,
+                    subscriber: tx-sender,
+                })
+                (err u416)
+            ))
+        )
+        (asserts! (get is-active subscription-info) (err u417))
+        (map-set channel-subscribers {
+            channel-id: channel-id,
+            subscriber: tx-sender,
+        }
+            (merge subscription-info { is-active: false })
+        )
+        (map-set subscription-channels { channel-id: channel-id }
+            (merge channel { subscriber-count: (- (get subscriber-count channel) u1) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (deactivate-channel (channel-id uint))
+    (let ((channel (unwrap! (map-get? subscription-channels { channel-id: channel-id })
+            (err u418)
+        )))
+        (asserts! (is-eq tx-sender (get creator channel)) (err u419))
+        (asserts! (get is-active channel) (err u420))
+        (map-set subscription-channels { channel-id: channel-id }
+            (merge channel { is-active: false })
+        )
+        (ok true)
+    )
+)
+
+(define-private (update-user-subscription-stats
+        (user principal)
+        (created-channel bool)
+        (subscribed-channel bool)
+        (fees-paid uint)
+        (earnings uint)
+    )
+    (let ((current-stats (default-to {
+            channels-created: u0,
+            channels-subscribed: u0,
+            total-subscription-fees-paid: u0,
+            total-earnings-from-channels: u0,
+        }
+            (map-get? user-subscription-stats { user: user })
+        )))
+        (map-set user-subscription-stats { user: user } {
+            channels-created: (if created-channel
+                (+ (get channels-created current-stats) u1)
+                (get channels-created current-stats)
+            ),
+            channels-subscribed: (if subscribed-channel
+                (+ (get channels-subscribed current-stats) u1)
+                (get channels-subscribed current-stats)
+            ),
+            total-subscription-fees-paid: (+ (get total-subscription-fees-paid current-stats) fees-paid),
+            total-earnings-from-channels: (+ (get total-earnings-from-channels current-stats) earnings),
+        })
+    )
+)
+
+(define-read-only (get-subscription-channel (channel-id uint))
+    (map-get? subscription-channels { channel-id: channel-id })
+)
+
+(define-read-only (get-channel-subscription-info
+        (channel-id uint)
+        (subscriber principal)
+    )
+    (map-get? channel-subscribers {
+        channel-id: channel-id,
+        subscriber: subscriber,
+    })
+)
+
+(define-read-only (get-user-subscription-stats (user principal))
+    (map-get? user-subscription-stats { user: user })
+)
+
+(define-read-only (get-broadcast-message-info (message-id uint))
+    (map-get? broadcast-messages { message-id: message-id })
+)
+
+(define-read-only (is-channel-subscriber
+        (channel-id uint)
+        (user principal)
+    )
+    (default-to false
+        (get is-active
+            (map-get? channel-subscribers {
+                channel-id: channel-id,
+                subscriber: user,
+            })
+        ))
+)
+
+(define-read-only (get-total-subscription-channels)
+    (var-get total-subscriptions)
+)
+
+(define-read-only (calculate-broadcast-fee (channel-id uint))
+    (match (map-get? subscription-channels { channel-id: channel-id })
+        channel-info (* message-stake broadcast-multiplier (get subscriber-count channel-info))
+        u0
+    )
+)
