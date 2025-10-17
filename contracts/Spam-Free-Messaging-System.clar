@@ -1123,3 +1123,225 @@
         u0
     )
 )
+
+(define-constant min-tip-amount u100000)
+(define-constant reward-boost-multiplier u5)
+
+(define-map message-rewards
+    { message-id: uint }
+    {
+        total-tips: uint,
+        tip-count: uint,
+        has-auto-refund: bool,
+        reward-distributed: bool,
+    }
+)
+
+(define-map message-tips
+    {
+        message-id: uint,
+        tipper: principal,
+    }
+    {
+        tip-amount: uint,
+        tip-time: uint,
+    }
+)
+
+(define-map user-reward-stats
+    { user: principal }
+    {
+        total-tips-sent: uint,
+        total-tips-received: uint,
+        messages-tipped: uint,
+        tips-received-count: uint,
+        reward-score: uint,
+    }
+)
+
+(define-public (tip-message
+        (message-id uint)
+        (tip-amount uint)
+    )
+    (let (
+            (message (unwrap! (map-get? messages { message-id: message-id }) (err u501)))
+            (sender-address (get sender message))
+            (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+            (current-rewards (default-to {
+                total-tips: u0,
+                tip-count: u0,
+                has-auto-refund: false,
+                reward-distributed: false,
+            }
+                (map-get? message-rewards { message-id: message-id })
+            ))
+        )
+        (asserts! (not (is-eq tx-sender sender-address)) (err u502))
+        (asserts! (not (get is-spam message)) (err u503))
+        (asserts! (>= tip-amount min-tip-amount) (err u504))
+        (asserts!
+            (is-none (map-get? message-tips {
+                message-id: message-id,
+                tipper: tx-sender,
+            }))
+            (err u505)
+        )
+        (try! (stx-transfer? tip-amount tx-sender sender-address))
+        (map-set message-tips {
+            message-id: message-id,
+            tipper: tx-sender,
+        } {
+            tip-amount: tip-amount,
+            tip-time: current-time,
+        })
+        (map-set message-rewards { message-id: message-id } {
+            total-tips: (+ (get total-tips current-rewards) tip-amount),
+            tip-count: (+ (get tip-count current-rewards) u1),
+            has-auto-refund: (get has-auto-refund current-rewards),
+            reward-distributed: (get reward-distributed current-rewards),
+        })
+        (update-user-reward-stats tx-sender true tip-amount)
+        (update-user-reward-stats sender-address false tip-amount)
+        (update-reputation sender-address true)
+        (ok true)
+    )
+)
+
+(define-public (enable-auto-refund-on-tip (message-id uint))
+    (let (
+            (message (unwrap! (map-get? messages { message-id: message-id }) (err u506)))
+            (current-rewards (default-to {
+                total-tips: u0,
+                tip-count: u0,
+                has-auto-refund: false,
+                reward-distributed: false,
+            }
+                (map-get? message-rewards { message-id: message-id })
+            ))
+        )
+        (asserts! (is-eq tx-sender (get sender message)) (err u507))
+        (asserts! (not (get refunded message)) (err u508))
+        (asserts! (not (get is-spam message)) (err u509))
+        (asserts! (not (get has-auto-refund current-rewards)) (err u510))
+        (map-set message-rewards { message-id: message-id }
+            (merge current-rewards { has-auto-refund: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (trigger-auto-refund (message-id uint))
+    (let (
+            (message (unwrap! (map-get? messages { message-id: message-id }) (err u511)))
+            (rewards (unwrap! (map-get? message-rewards { message-id: message-id })
+                (err u512)
+            ))
+        )
+        (asserts! (get has-auto-refund rewards) (err u513))
+        (asserts! (> (get tip-count rewards) u0) (err u514))
+        (asserts! (not (get refunded message)) (err u515))
+        (asserts! (not (get is-spam message)) (err u516))
+        (try! (as-contract (stx-transfer? (get stake message) tx-sender (get sender message))))
+        (map-set messages { message-id: message-id }
+            (merge message { refunded: true })
+        )
+        (var-set total-stakes (- (var-get total-stakes) (get stake message)))
+        (var-set contract-balance
+            (- (var-get contract-balance) (get stake message))
+        )
+        (ok true)
+    )
+)
+
+(define-public (distribute-reward-bonus (message-id uint))
+    (let (
+            (message (unwrap! (map-get? messages { message-id: message-id }) (err u517)))
+            (rewards (unwrap! (map-get? message-rewards { message-id: message-id })
+                (err u518)
+            ))
+            (sender-address (get sender message))
+            (bonus-amount (* (get tip-count rewards) reward-boost-multiplier))
+        )
+        (asserts! (not (get reward-distributed rewards)) (err u519))
+        (asserts! (>= (get tip-count rewards) u3) (err u520))
+        (asserts! (not (get is-spam message)) (err u521))
+        (asserts! (<= bonus-amount (var-get contract-balance)) (err u522))
+        (try! (as-contract (stx-transfer? bonus-amount tx-sender sender-address)))
+        (map-set message-rewards { message-id: message-id }
+            (merge rewards { reward-distributed: true })
+        )
+        (var-set contract-balance (- (var-get contract-balance) bonus-amount))
+        (update-reputation sender-address true)
+        (ok bonus-amount)
+    )
+)
+
+(define-private (update-user-reward-stats
+        (user principal)
+        (is-tipper bool)
+        (amount uint)
+    )
+    (let ((current-stats (default-to {
+            total-tips-sent: u0,
+            total-tips-received: u0,
+            messages-tipped: u0,
+            tips-received-count: u0,
+            reward-score: u0,
+        }
+            (map-get? user-reward-stats { user: user })
+        )))
+        (if is-tipper
+            (map-set user-reward-stats { user: user }
+                (merge current-stats {
+                    total-tips-sent: (+ (get total-tips-sent current-stats) amount),
+                    messages-tipped: (+ (get messages-tipped current-stats) u1),
+                })
+            )
+            (map-set user-reward-stats { user: user }
+                (merge current-stats {
+                    total-tips-received: (+ (get total-tips-received current-stats) amount),
+                    tips-received-count: (+ (get tips-received-count current-stats) u1),
+                    reward-score: (+ (get reward-score current-stats) u10),
+                })
+            )
+        )
+    )
+)
+
+(define-read-only (get-message-rewards (message-id uint))
+    (map-get? message-rewards { message-id: message-id })
+)
+
+(define-read-only (get-message-tip
+        (message-id uint)
+        (tipper principal)
+    )
+    (map-get? message-tips {
+        message-id: message-id,
+        tipper: tipper,
+    })
+)
+
+(define-read-only (get-user-reward-stats (user principal))
+    (map-get? user-reward-stats { user: user })
+)
+
+(define-read-only (calculate-reward-bonus (message-id uint))
+    (match (map-get? message-rewards { message-id: message-id })
+        rewards (if (>= (get tip-count rewards) u3)
+            (some (* (get tip-count rewards) reward-boost-multiplier))
+            none
+        )
+        none
+    )
+)
+
+(define-read-only (is-eligible-for-auto-refund (message-id uint))
+    (match (map-get? message-rewards { message-id: message-id })
+        rewards (and
+            (get has-auto-refund rewards)
+            (> (get tip-count rewards) u0)
+        )
+        false
+    )
+)
