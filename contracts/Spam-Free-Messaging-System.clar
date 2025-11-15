@@ -89,6 +89,7 @@
             refunded: false,
             is-spam: false,
         })
+        (inbox-index recipient message-id)
         (update-user-stats tx-sender true)
         (update-user-stats recipient false)
         (var-set total-messages (+ message-id u1))
@@ -1343,5 +1344,66 @@
             (> (get tip-count rewards) u0)
         )
         false
+    )
+)
+
+(define-map inbox-counts
+    { recipient: principal }
+    { count: uint }
+)
+
+(define-map inbox-index-map
+    {
+        recipient: principal,
+        index: uint,
+    }
+    { message-id: uint }
+)
+
+(define-read-only (get-inbox-count (recipient principal))
+    (default-to u0 (get count (map-get? inbox-counts { recipient: recipient })))
+)
+
+(define-read-only (get-inbox-message
+        (recipient principal)
+        (index uint)
+    )
+    (let ((count (default-to u0
+            (get count (map-get? inbox-counts { recipient: recipient }))
+        )))
+        (if (>= index count)
+            (err u601)
+            (let ((entry (unwrap!
+                    (map-get? inbox-index-map {
+                        recipient: recipient,
+                        index: index,
+                    })
+                    (err u602)
+                )))
+                (ok (get message-id entry))
+            )
+        )
+    )
+)
+
+(define-private (inbox-index
+        (recipient principal)
+        (message-id uint)
+    )
+    (let (
+            (current-count (default-to u0
+                (get count (map-get? inbox-counts { recipient: recipient }))
+            ))
+            (next-count (+ current-count u1))
+        )
+        (begin
+            (map-set inbox-index-map {
+                recipient: recipient,
+                index: current-count,
+            } { message-id: message-id }
+            )
+            (map-set inbox-counts { recipient: recipient } { count: next-count })
+            true
+        )
     )
 )
